@@ -111,6 +111,10 @@ export function useSSEChat() {
         }
 
         let list = candidateLists[0] || [];
+        const stripSuffix = (s?: string) => {
+          if (!s || typeof s !== "string") return s || "";
+          return s.replace(/\.(AIRPORT|CITY)$/i, "");
+        };
         const toCard = (obj: any) => {
           // map to Chat FlightCard props: { from, to, departure, arrival, duration, price, airline }
           let airline: string | undefined;
@@ -147,8 +151,8 @@ export function useSSEChat() {
               airline = first.carrier || first.airline || first.marketingCarrier || airline || obj.airline;
               departure = first.departureTime || first.departure || first.departureDateTime || obj.departTime || departure;
               arrival = last.arrivalTime || last.arrival || last.arrivalDateTime || obj.arriveTime || arrival;
-              from = first.origin || first.departureAirport || first.originCode || from;
-              to = last.destination || last.arrivalAirport || last.destinationCode || to;
+              from = stripSuffix(first.origin || first.departureAirport || first.originCode || from);
+              to = stripSuffix(last.destination || last.arrivalAirport || last.destinationCode || to);
             }
 
             // top-level fallbacks
@@ -156,13 +160,20 @@ export function useSSEChat() {
             duration = obj.duration || obj.totalDuration || duration;
             departure = departure || obj.departTime;
             arrival = arrival || obj.arriveTime;
+            // origin/destination fallbacks coming from backend compact items
+            from = from || obj.from;
+            to = to || obj.to;
           }
 
+          // If no exact times, show codes so cards aren't empty
+          const depOut = departure || stripSuffix(from) || "";
+          const arrOut = arrival || stripSuffix(to) || "";
+
           return {
-            from: from || "",
-            to: to || "",
-            departure: departure || "",
-            arrival: arrival || "",
+            from: stripSuffix(from) || "",
+            to: stripSuffix(to) || "",
+            departure: depOut,
+            arrival: arrOut,
             duration: duration || "",
             price: price || "",
             airline: airline || "",

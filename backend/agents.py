@@ -505,6 +505,9 @@ async def flight_agent(state: AgentState) -> dict[str, Any]:
                         price_obj = {"amount": amount, "currency": currency}
                     top_structured.append({
                         "airline": name,
+                        "airlineCode": al.get("iataCode"),
+                        "logoUrl": al.get("logoUrl"),
+                        "count": al.get("count"),
                         "price": price_obj,
                         "currency": currency or "",
                         "from": from_id,
