@@ -4,9 +4,11 @@ Each tool supports interruption checking for graceful cancellation.
 """
 
 from langchain_core.tools import tool
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 import asyncio
 import time
+import os
+import httpx
 
 
 @tool
@@ -15,102 +17,161 @@ async def search_flights(
     destination: str,
     date: Optional[str] = None,
     passengers: int = 1,
+    returnDate: Optional[str] = None,
+    stops: str = "none",
+    pageNo: int = 1,
+    children: Optional[str] = None,
+    sort: str = "BEST",
+    cabinClass: str = "ECONOMY",
+    currency_code: str = "USD",
     interruption_check: Optional[dict] = None
 ) -> dict[str, Any]:
     """
-    Search for flights between origin and destination.
-    
-    Args:
-        origin: Departure city/airport code
-        destination: Arrival city/airport code
-        date: Travel date (optional)
-        passengers: Number of passengers
-        interruption_check: Dict with 'should_interrupt' flag for cancellation
-    
-    Returns:
-        Flight search results or interruption status
+    Search for flights via RapidAPI Booking.com flights endpoint.
+
+    Note: 'origin' and 'destination' are treated as fromId/toId (e.g., 'BOM.AIRPORT').
+    'date' maps to 'departDate'.
     """
-    # Check for interruption before starting search
     if interruption_check and interruption_check.get("should_interrupt"):
-        return {
-            "status": "interrupted",
-            "message": "Flight search was cancelled",
-            "partial_results": interruption_check.get("partial_results", {})
-        }
-    
-    # Simulate API call with periodic interruption checks
-    await asyncio.sleep(0.5)  # Simulate network delay
-    
-    # Check interruption mid-operation
-    if interruption_check and interruption_check.get("should_interrupt"):
-        return {
-            "status": "interrupted",
-            "message": "Flight search was cancelled during operation",
-            "partial_results": {"progress": "50%"}
-        }
-    
-    # Mock flight data (replace with real API calls)
-    flights = [
-        {
-            "id": "FL001",
-            "airline": "United Airlines",
-            "flight_number": "UA1234",
-            "origin": origin.upper(),
-            "destination": destination.upper(),
-            "departure_time": "08:00 AM",
-            "arrival_time": "11:30 AM",
-            "duration": "5h 30m",
-            "price": 450,
-            "currency": "USD",
-            "stops": 0,
-            "aircraft": "Boeing 737",
-            "available_seats": 45
-        },
-        {
-            "id": "FL002",
-            "airline": "Delta Airlines",
-            "flight_number": "DL5678",
-            "origin": origin.upper(),
-            "destination": destination.upper(),
-            "departure_time": "02:15 PM",
-            "arrival_time": "05:45 PM",
-            "duration": "5h 30m",
-            "price": 380,
-            "currency": "USD",
-            "stops": 0,
-            "aircraft": "Airbus A320",
-            "available_seats": 32
-        },
-        {
-            "id": "FL003",
-            "airline": "American Airlines",
-            "flight_number": "AA9012",
-            "origin": origin.upper(),
-            "destination": destination.upper(),
-            "departure_time": "06:45 PM",
-            "arrival_time": "10:15 PM",
-            "duration": "5h 30m",
-            "price": 520,
-            "currency": "USD",
-            "stops": 1,
-            "aircraft": "Boeing 787",
-            "available_seats": 18
-        }
-    ]
-    
-    return {
-        "status": "success",
-        "query": {
-            "origin": origin,
-            "destination": destination,
-            "date": date or "flexible",
-            "passengers": passengers
-        },
-        "flights": flights,
-        "count": len(flights),
-        "search_timestamp": time.time()
+        return {"status": "interrupted", "message": "Flight search was cancelled"}
+
+    api_key = os.getenv("RAPIDAPI_KEY")
+    if not api_key:
+        return {"status": "error", "message": "RAPIDAPI_KEY not set in environment"}
+
+    if not origin or not destination:
+        return {"status": "error", "message": "origin (fromId) and destination (toId) are required"}
+    if not date:
+        return {"status": "error", "message": "date (departDate) is required in format YYYY-MM-DD"}
+
+    base_url = "https://booking-com15.p.rapidapi.com/api/v1/flights/searchFlights"
+    params = {
+        "fromId": origin,
+        "toId": destination,
+        "departDate": date,
+        "stops": stops,
+        "pageNo": pageNo,
+        "adults": passengers,
+        "sort": sort,
+        "cabinClass": cabinClass,
+        "currency_code": currency_code,
+    }
+    if returnDate:
+        params["returnDate"] = returnDate
+    if children:
+        params["children"] = children
+
+    headers = {
+        "x-rapidapi-host": "booking-com15.p.rapidapi.com",
+        "x-rapidapi-key": api_key,
     }
 
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(base_url, params=params, headers=headers)
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+            if resp.status_code >= 400:
+                return {
+                    "status": "error",
+                    "code": resp.status_code,
+                    "message": data.get("message") if isinstance(data, dict) else "HTTP error",
+                    "response": data,
+                }
+            return {
+                "status": "success",
+                "query": params,
+                "results": data,
+            }
+    except httpx.RequestError as e:
+        return {"status": "error", "message": f"Network error: {e}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Unexpected error: {e}"}
+
+
+@tool
+async def booking_search_hotels(
+    dest_id: int,
+    search_type: str,
+    arrival_date: str,
+    departure_date: str,
+    adults: int = 1,
+    children_age: Optional[str] = None,
+    room_qty: int = 1,
+    page_number: int = 1,
+    price_min: int = 0,
+    price_max: int = 0,
+    sort_by: Optional[str] = None,
+    categories_filter: Optional[str] = None,
+    units: str = "metric",
+    temperature_unit: str = "c",
+    languagecode: str = "en-us",
+    currency_code: str = "USD",
+    location: Optional[str] = None,
+    interruption_check: Optional[dict] = None
+) -> Dict[str, Any]:
+    """
+    Search hotels via Booking.com RapidAPI.
+
+    Requires environment variable RAPIDAPI_KEY to be set.
+    """
+    # Interruption check
+    if interruption_check and interruption_check.get("should_interrupt"):
+        return {"status": "interrupted", "message": "Hotel search cancelled"}
+
+    api_key = os.getenv("RAPIDAPI_KEY")
+    if not api_key:
+        return {"status": "error", "message": "RAPIDAPI_KEY not set in environment"}
+
+    base_url = "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels"
+    params = {
+        "dest_id": dest_id,
+        "search_type": search_type,
+        "arrival_date": arrival_date,
+        "departure_date": departure_date,
+        "adults": adults,
+        "room_qty": room_qty,
+        "page_number": page_number,
+        "price_min": price_min,
+        "price_max": price_max,
+        "units": units,
+        "temperature_unit": temperature_unit,
+        "languagecode": languagecode,
+        "currency_code": currency_code,
+    }
+    if children_age:
+        params["children_age"] = children_age
+    if sort_by:
+        params["sort_by"] = sort_by
+    if categories_filter:
+        params["categories_filter"] = categories_filter
+    if location:
+        params["location"] = location
+
+    headers = {
+        "x-rapidapi-host": "booking-com15.p.rapidapi.com",
+        "x-rapidapi-key": api_key,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(base_url, params=params, headers=headers)
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+            if resp.status_code >= 400:
+                return {
+                    "status": "error",
+                    "code": resp.status_code,
+                    "message": data.get("message") if isinstance(data, dict) else "HTTP error",
+                    "response": data,
+                }
+            return {
+                "status": "success",
+                "query": params,
+                "results": data,
+            }
+    except httpx.RequestError as e:
+        return {"status": "error", "message": f"Network error: {e}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Unexpected error: {e}"}
 
 @tool
 async def search_hotels(
@@ -262,4 +323,4 @@ async def web_search(
 
 
 # Export all tools as a list
-ALL_TOOLS = [search_flights, search_hotels, web_search]
+ALL_TOOLS = [search_flights, search_hotels, booking_search_hotels, web_search]

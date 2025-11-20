@@ -67,21 +67,150 @@ export function useSSEChat() {
   }, []);
 
   const parseFlightResults = (content: string): any[] | null => {
+    // 1) Try to extract JSON payload printed by Flight Agent (snippet or full)
     try {
-      // Extract flight data from coordinator/flight agent messages
+      // Prefer a block that explicitly starts with {"items": ...}
+      let raw: string | null = null;
+      const idx = content.lastIndexOf('{"items"');
+      if (idx !== -1) {
+        let block = content.slice(idx).trim();
+        // Trim to the last closing brace
+        const lastBrace = block.lastIndexOf('}');
+        if (lastBrace !== -1) block = block.slice(0, lastBrace + 1);
+        raw = block;
+      }
+      // Fallback to regex search if direct slice not found
+      if (!raw) {
+        const allMatches = [...content.matchAll(/\{[\s\S]*\}/g)];
+        for (let i = allMatches.length - 1; i >= 0; i--) {
+          const txt = allMatches[i][0];
+          if (txt.includes('"items"')) { raw = txt; break; }
+        }
+        if (!raw && allMatches.length) raw = allMatches[allMatches.length - 1][0];
+      }
+      if (raw) {
+        const payload = JSON.parse(raw);
+        const root = payload?.results ?? payload; // tool returns {status, query, results}
+        const data = root?.data ?? root;
+        const candidateLists: any[] = [];
+
+        const addListsFrom = (obj: any) => {
+          if (!obj || typeof obj !== "object") return;
+          ["results", "itineraries", "itineraryList", "flights", "items"].forEach((k) => {
+            const v = obj[k];
+            if (Array.isArray(v) && v.length) candidateLists.push(v);
+          });
+        };
+
+        addListsFrom(data);
+        if (Array.isArray(data)) candidateLists.push(data);
+        if (data && typeof data === "object") {
+          Object.values(data).forEach((v) => {
+            if (Array.isArray(v) && v.length) candidateLists.push(v);
+          });
+        }
+
+        let list = candidateLists[0] || [];
+        const toCard = (obj: any) => {
+          // map to Chat FlightCard props: { from, to, departure, arrival, duration, price, airline }
+          let airline: string | undefined;
+          let price: string | undefined;
+          let departure: string | undefined;
+          let arrival: string | undefined;
+          let duration: string | undefined;
+          let from: string | undefined;
+          let to: string | undefined;
+
+          if (obj && typeof obj === "object") {
+            // price (support compact item shape from backend)
+            const p = obj.price ?? obj.pricing;
+            if (typeof p === "number") price = `$${Math.round(p)}`;
+            else if (typeof p === "string") price = p;
+            else if (p && typeof p === "object") {
+              const amount = p.amount ?? p.total ?? p.units;
+              const nanos = p.nanos ?? 0;
+              let val: number | undefined = undefined;
+              if (typeof amount === "number") val = amount;
+              if (typeof amount === "string") val = parseFloat(amount);
+              if (typeof val === "number") {
+                const total = val + (typeof nanos === "number" ? nanos / 1e9 : 0);
+                const cur = obj.currency || p.currency || p.currencyCode || "";
+                price = `${Math.round(total)}${cur ? ` ${cur}` : ""}`;
+              }
+            }
+
+            // segments/legs
+            const segments = obj.segments || obj.legs || obj.itinerarySegments || [];
+            if (Array.isArray(segments) && segments.length) {
+              const first = segments[0] || {};
+              const last = segments[segments.length - 1] || {};
+              airline = first.carrier || first.airline || first.marketingCarrier || airline || obj.airline;
+              departure = first.departureTime || first.departure || first.departureDateTime || obj.departTime || departure;
+              arrival = last.arrivalTime || last.arrival || last.arrivalDateTime || obj.arriveTime || arrival;
+              from = first.origin || first.departureAirport || first.originCode || from;
+              to = last.destination || last.arrivalAirport || last.destinationCode || to;
+            }
+
+            // top-level fallbacks
+            airline = airline || obj.airline;
+            duration = obj.duration || obj.totalDuration || duration;
+            departure = departure || obj.departTime;
+            arrival = arrival || obj.arriveTime;
+          }
+
+          return {
+            from: from || "",
+            to: to || "",
+            departure: departure || "",
+            arrival: arrival || "",
+            duration: duration || "",
+            price: price || "",
+            airline: airline || "",
+          };
+        };
+
+        let cards = list.slice(0, 10).map(toCard).filter((c: any) => Object.values(c).some(Boolean));
+        if (cards.length) return cards;
+
+        // Fallback: synthesize from aggregation.airlines
+        const rootObj = data?.data && typeof data.data === "object" ? data.data : data;
+        const airlines = rootObj?.aggregation?.airlines;
+        if (Array.isArray(airlines) && airlines.length) {
+          cards = airlines.slice(0, 10).map((al: any) => {
+            const mp = al?.minPricePerAdult || al?.minPrice || {};
+            const amount = mp?.units ?? mp?.amount;
+            const currency = mp?.currencyCode || mp?.currency || "";
+            const price = typeof amount === "number" ? `${Math.round(amount)}${currency ? ` ${currency}` : ""}` : "";
+            return {
+              from: "",
+              to: "",
+              departure: "",
+              arrival: "",
+              duration: "",
+              price,
+              airline: al?.name || al?.iataCode || "",
+            };
+          }).filter((c: any) => Object.values(c).some(Boolean));
+          if (cards.length) return cards;
+        }
+      }
+    } catch {
+      // fall through
+    }
+
+    // 2) Legacy text parsing fallback
+    try {
       const flightPattern = /(\d+)\.\s*([^-]+?)\s*-\s*\$(\d+)\s*\n\s*(\d{1,2}:\d{2}\s*[AP]M)\s*→\s*(\d{1,2}:\d{2}\s*[AP]M)\s*\(([^)]+)\)/g;
       const matches = [...content.matchAll(flightPattern)];
-      
       if (matches.length === 0) return null;
-
-      return matches.map(match => ({
+      return matches.map((match) => ({
         airline: match[2].trim(),
         price: `$${match[3]}`,
         departure: match[4],
         arrival: match[5],
         duration: match[6],
-        from: "NYC", // Default, should be extracted
-        to: "LAX",
+        from: "",
+        to: "",
       }));
     } catch {
       return null;
@@ -219,6 +348,7 @@ export function useSSEChat() {
 
               case "agent_message":
                 currentMessageBufferRef.current += event.content;
+                const fullContent = currentMessageBufferRef.current;
                 
                 // Create or update assistant message
                 setMessages((prev) => {
@@ -226,13 +356,12 @@ export function useSSEChat() {
                   const agentType = event.agent.includes("coordinator") ? "coordinator" :
                                    event.agent.includes("flight") ? "flight" :
                                    event.agent.includes("hotel") ? "hotel" : "research";
-                  
-                  const flightResults = parseFlightResults(event.content);
-                  const hotelResults = parseHotelResults(event.content);
+                  const flightResults = parseFlightResults(fullContent);
+                  const hotelResults = parseHotelResults(fullContent);
 
                   const newMessage: ChatMessage = {
                     id: `${event.agent}-${Date.now()}`,
-                    text: event.content,
+                    text: fullContent,
                     isUser: false,
                     timestamp: new Date(),
                     agentType: agentType as any,
@@ -252,6 +381,19 @@ export function useSSEChat() {
                 const completedAgent = event.agent.includes("coordinator") ? "coordinator" :
                                       event.agent.includes("flight") ? "flight" :
                                       event.agent.includes("hotel") ? "hotel" : "research";
+                // On completion, parse the full buffer one more time to catch final JSON
+                if (completedAgent === "flight") {
+                  const finalContent = currentMessageBufferRef.current;
+                  const finalCards = parseFlightResults(finalContent);
+                  if (finalCards && finalCards.length) {
+                    setMessages((prev) => {
+                      const last = prev[prev.length - 1];
+                      if (!last || last.isUser) return prev;
+                      const updated = { ...last, text: finalContent, flightResults: finalCards };
+                      return [...prev.slice(0, -1), updated];
+                    });
+                  }
+                }
                 updateAgentStatus(completedAgent, "complete");
                 break;
 

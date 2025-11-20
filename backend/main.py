@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from graph import travel_graph
 from state import AgentState
 from langchain_core.messages import HumanMessage
+from typing import Optional, AsyncGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -165,15 +166,20 @@ async def generate_sse_events(
                 agent_name = event_name
                 if any(x in agent_name for x in ["coordinator", "flight", "hotel", "research"]):
                     output = event_data.get("output", {})
-                    
-                    # Extract messages if available
-                    messages = output.get("messages", [])
-                    if messages:
-                        last_message = messages[-1]
-                        content = last_message.content if hasattr(last_message, 'content') else str(last_message)
-                        
-                        yield f"data: {json.dumps({'type': 'agent_message', 'agent': agent_name, 'content': content, 'timestamp': time.time()})}\n\n"
-                    
+
+                    # Extract messages/content safely whether output is dict or str
+                    content_to_emit = None
+                    if isinstance(output, dict):
+                        messages = output.get("messages", [])
+                        if messages:
+                            last_message = messages[-1]
+                            content_to_emit = last_message.content if hasattr(last_message, 'content') else str(last_message)
+                    elif isinstance(output, str):
+                        content_to_emit = output
+
+                    if content_to_emit:
+                        yield f"data: {json.dumps({'type': 'agent_message', 'agent': agent_name, 'content': content_to_emit, 'timestamp': time.time()})}\n\n"
+
                     # Send agent completion
                     yield f"data: {json.dumps({'type': 'agent_complete', 'agent': agent_name, 'timestamp': time.time()})}\n\n"
             
@@ -230,6 +236,103 @@ async def root():
         "active_queries": len(active_queries)
     }
 
+
+@app.get("/api/hotels/search")
+async def api_hotels_search(
+    dest_id: int,
+    search_type: str,
+    arrival_date: str,
+    departure_date: str,
+    adults: int = 1,
+    children_age: Optional[str] = None,
+    room_qty: int = 1,
+    page_number: int = 1,
+    price_min: int = 0,
+    price_max: int = 0,
+    sort_by: Optional[str] = None,
+    categories_filter: Optional[str] = None,
+    units: str = "metric",
+    temperature_unit: str = "c",
+    languagecode: str = "en-us",
+    currency_code: str = "USD",
+    location: Optional[str] = None,
+):
+    """Proxy endpoint to Booking.com RapidAPI hotels search.
+    Requires RAPIDAPI_KEY in environment.
+    """
+    try:
+        # Import inside function to avoid circular deps during startup
+        from tools import booking_search_hotels
+
+        result = await booking_search_hotels.ainvoke({
+            "dest_id": dest_id,
+            "search_type": search_type,
+            "arrival_date": arrival_date,
+            "departure_date": departure_date,
+            "adults": adults,
+            "children_age": children_age,
+            "room_qty": room_qty,
+            "page_number": page_number,
+            "price_min": price_min,
+            "price_max": price_max,
+            "sort_by": sort_by,
+            "categories_filter": categories_filter,
+            "units": units,
+            "temperature_unit": temperature_unit,
+            "languagecode": languagecode,
+            "currency_code": currency_code,
+            "location": location,
+        })
+
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/flights/search")
+async def api_flights_search(
+    fromId: str,
+    toId: str,
+    departDate: str,
+    returnDate: Optional[str] = None,
+    stops: str = "none",
+    pageNo: int = 1,
+    adults: int = 1,
+    children: Optional[str] = None,
+    sort: str = "BEST",
+    cabinClass: str = "ECONOMY",
+    currency_code: str = "USD",
+):
+    """Proxy endpoint to Booking.com RapidAPI flights search.
+    Requires RAPIDAPI_KEY in environment.
+    """
+    try:
+        from tools import search_flights
+
+        result = await search_flights.ainvoke({
+            "origin": fromId,
+            "destination": toId,
+            "date": departDate,
+            "returnDate": returnDate,
+            "stops": stops,
+            "pageNo": pageNo,
+            "passengers": adults,
+            "children": children,
+            "sort": sort,
+            "cabinClass": cabinClass,
+            "currency_code": currency_code,
+        })
+
+        if result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/chat/stream")
 async def stream_chat(request: QueryRequest):
