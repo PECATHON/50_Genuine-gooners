@@ -229,20 +229,58 @@ export function useSSEChat() {
   };
 
   const parseHotelResults = (content: string): any[] | null => {
+    // Preferred: JSON with {"hotels": [...]}
+    try {
+      let raw: string | null = null;
+      const idx = content.lastIndexOf('{"hotels"');
+      if (idx !== -1) {
+        let block = content.slice(idx).trim();
+        const lastBrace = block.lastIndexOf('}');
+        if (lastBrace !== -1) block = block.slice(0, lastBrace + 1);
+        raw = block;
+      }
+      if (!raw) {
+        const allMatches = [...content.matchAll(/\{[\s\S]*\}/g)];
+        for (let i = allMatches.length - 1; i >= 0; i--) {
+          const txt = allMatches[i][0];
+          if (txt.includes('"hotels"')) { raw = txt; break; }
+        }
+      }
+      if (raw) {
+        const payload = JSON.parse(raw);
+        const hotels = payload?.hotels;
+        if (Array.isArray(hotels) && hotels.length) {
+          return hotels.slice(0, 6).map((h: any) => {
+            const amount = h?.price?.amount;
+            const currency = h?.price?.currency || "";
+            const price = typeof amount === "number" ? `${Math.round(amount)}${currency ? ` ${currency}` : ""}` : "";
+            return {
+              name: h?.name || "Hotel",
+              location: h?.location || "",
+              rating: typeof h?.rating === "number" ? h.rating : 0,
+              price,
+              amenities: Array.isArray(h?.amenities) ? h.amenities : [],
+              imageUrl: h?.imageUrl,
+            };
+          });
+        }
+      }
+    } catch {
+      // fall through
+    }
+
+    // Fallback: legacy regex
     try {
       const hotelPattern = /(\d+)\.\s*([^-]+?)\s*-\s*\$(\d+)\/night\s*\n\s*Rating:\s*([\d.]+)⭐\s*\((\d+)\s*reviews\)/g;
       const matches = [...content.matchAll(hotelPattern)];
-      
       if (matches.length === 0) return null;
-
       return matches.map(match => ({
         name: match[2].trim(),
         price: `$${match[3]}`,
         rating: parseFloat(match[4]),
         reviews_count: parseInt(match[5]),
-        location: "Los Angeles",
-        amenities: ["Pool", "Gym", "Free WiFi"],
-        imageUrl: "https://images.unsplash.com/photo-1566073771259-6a8506099945?w=800&q=80",
+        location: "",
+        amenities: [],
       }));
     } catch {
       return null;
@@ -393,14 +431,15 @@ export function useSSEChat() {
                                       event.agent.includes("flight") ? "flight" :
                                       event.agent.includes("hotel") ? "hotel" : "research";
                 // On completion, parse the full buffer one more time to catch final JSON
-                if (completedAgent === "flight") {
+                if (completedAgent === "flight" || completedAgent === "hotel") {
                   const finalContent = currentMessageBufferRef.current;
-                  const finalCards = parseFlightResults(finalContent);
-                  if (finalCards && finalCards.length) {
+                  const finalFlights = parseFlightResults(finalContent);
+                  const finalHotels = parseHotelResults(finalContent);
+                  if ((finalFlights && finalFlights.length) || (finalHotels && finalHotels.length)) {
                     setMessages((prev) => {
                       const last = prev[prev.length - 1];
                       if (!last || last.isUser) return prev;
-                      const updated = { ...last, text: finalContent, flightResults: finalCards };
+                      const updated = { ...last, text: finalContent, flightResults: finalFlights || last.flightResults, hotelResults: finalHotels || last.hotelResults };
                       return [...prev.slice(0, -1), updated];
                     });
                   }

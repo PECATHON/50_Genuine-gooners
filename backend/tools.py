@@ -3,13 +3,74 @@ Tools for agent use - flight search, hotel search, and web search.
 Each tool supports interruption checking for graceful cancellation.
 """
 
-from langchain_core.tools import tool
-from typing import Optional, Any, Dict
-import asyncio
-import time
 import os
+import time
+import json
 import httpx
+import asyncio
 
+from langchain_core.tools import tool
+from typing import Optional, Any, Dict, Tuple
+
+# --- Lightweight in-memory cache (process-local) ---
+_CACHE: dict[Tuple[str, str], Tuple[float, Any]] = {}
+_TTL_SEC = 15 * 60  # 15 minutes
+
+def _cache_get(key: Tuple[str, str]):
+    now = time.time()
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if now - ts > _TTL_SEC:
+        _CACHE.pop(key, None)
+        return None
+    return val
+
+def _cache_set(key: Tuple[str, str], value: Any):
+    _CACHE[key] = (time.time(), value)
+
+def _keys_from_env() -> list[str]:
+    # Allow multiple keys separated by commas
+    raw = os.getenv("RAPIDAPI_KEY", "").strip()
+    if not raw:
+        return []
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+async def _rapidapi_get(url: str, params: dict) -> dict[str, Any]:
+    keys = _keys_from_env()
+    if not keys:
+        return {"status": "error", "message": "RAPIDAPI_KEY not set in environment"}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        last_error: dict[str, Any] | None = None
+        for key in keys:
+            headers = {
+                "x-rapidapi-host": "booking-com15.p.rapidapi.com",
+                "x-rapidapi-key": key,
+            }
+            resp = await client.get(url, params=params, headers=headers)
+            ct = resp.headers.get("content-type", "")
+            data = resp.json() if ct.startswith("application/json") else {"raw": resp.text}
+            if resp.status_code == 200:
+                return {"status": "success", "data": data}
+            # If 429 or auth/quota issue, try next key
+            if resp.status_code in (401, 403, 429):
+                last_error = {
+                    "status": "error",
+                    "code": resp.status_code,
+                    "message": (data.get("message") if isinstance(data, dict) else "HTTP error"),
+                    "response": data,
+                }
+                continue
+            # Other errors: return immediately
+            return {
+                "status": "error",
+                "code": resp.status_code,
+                "message": (data.get("message") if isinstance(data, dict) else "HTTP error"),
+                "response": data,
+            }
+        return last_error or {"status": "error", "message": "All RapidAPI keys failed"}
 
 @tool
 async def search_flights(
@@ -35,9 +96,11 @@ async def search_flights(
     if interruption_check and interruption_check.get("should_interrupt"):
         return {"status": "interrupted", "message": "Flight search was cancelled"}
 
-    api_key = os.getenv("RAPIDAPI_KEY")
-    if not api_key:
-        return {"status": "error", "message": "RAPIDAPI_KEY not set in environment"}
+    # Cache key by main parameters
+    cache_key = ("flights", f"{origin}|{destination}|{date}|{passengers}|{stops}|{pageNo}|{sort}|{cabinClass}|{currency_code}")
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
 
     if not origin or not destination:
         return {"status": "error", "message": "origin (fromId) and destination (toId) are required"}
@@ -61,32 +124,39 @@ async def search_flights(
     if children:
         params["children"] = children
 
-    headers = {
-        "x-rapidapi-host": "booking-com15.p.rapidapi.com",
-        "x-rapidapi-key": api_key,
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(base_url, params=params, headers=headers)
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
-            if resp.status_code >= 400:
-                return {
-                    "status": "error",
-                    "code": resp.status_code,
-                    "message": data.get("message") if isinstance(data, dict) else "HTTP error",
-                    "response": data,
-                }
-            return {
-                "status": "success",
-                "query": params,
-                "results": data,
-            }
+        res = await _rapidapi_get(base_url, params)
+        if res.get("status") != "success":
+            return res
+        out = {"status": "success", "query": params, "results": res.get("data")}
+        _cache_set(cache_key, out)
+        return out
     except httpx.RequestError as e:
         return {"status": "error", "message": f"Network error: {e}"}
     except Exception as e:
         return {"status": "error", "message": f"Unexpected error: {e}"}
 
+@tool
+async def booking_search_destination(query: str) -> dict[str, Any]:
+    """Search destination IDs for hotels via RapidAPI (hotels/searchDestination)."""
+    base_url = "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination"
+    params = {"query": query}
+
+    try:
+        cache_key = ("dest", query)
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+        res = await _rapidapi_get(base_url, params)
+        if res.get("status") != "success":
+            return res
+        out = {"status": "success", "results": res.get("data")}
+        _cache_set(cache_key, out)
+        return out
+    except httpx.RequestError as e:
+        return {"status": "error", "message": f"Network error: {e}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Unexpected error: {e}"}
 
 @tool
 async def booking_search_hotels(
@@ -117,10 +187,6 @@ async def booking_search_hotels(
     # Interruption check
     if interruption_check and interruption_check.get("should_interrupt"):
         return {"status": "interrupted", "message": "Hotel search cancelled"}
-
-    api_key = os.getenv("RAPIDAPI_KEY")
-    if not api_key:
-        return {"status": "error", "message": "RAPIDAPI_KEY not set in environment"}
 
     base_url = "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels"
     params = {
@@ -172,6 +238,29 @@ async def booking_search_hotels(
         return {"status": "error", "message": f"Network error: {e}"}
     except Exception as e:
         return {"status": "error", "message": f"Unexpected error: {e}"}
+
+@tool
+async def booking_search_destination(query: str) -> dict[str, Any]:
+    """Search destination IDs for hotels via RapidAPI (hotels/searchDestination)."""
+    base_url = "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination"
+    params = {"query": query}
+
+    try:
+        cache_key = ("dest", query)
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+        res = await _rapidapi_get(base_url, params)
+        if res.get("status") != "success":
+            return res
+        out = {"status": "success", "results": res.get("data")}
+        _cache_set(cache_key, out)
+        return out
+    except httpx.RequestError as e:
+        return {"status": "error", "message": f"Network error: {e}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Unexpected error: {e}"}
+
 
 @tool
 async def search_hotels(
@@ -323,4 +412,5 @@ async def web_search(
 
 
 # Export all tools as a list
+ALL_TOOLS = [search_flights, search_hotels, booking_search_hotels, booking_search_destination, web_search]
 ALL_TOOLS = [search_flights, search_hotels, booking_search_hotels, web_search]

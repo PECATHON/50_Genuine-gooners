@@ -224,27 +224,54 @@ async def flight_agent(state: AgentState) -> dict[str, Any]:
     human_texts.append(state.get("user_query", ""))
     history_text = " \n".join([t for t in human_texts if isinstance(t, str)])
 
+    # Ensure current raw query is defined for parsing below
+    raw_query = state.get("user_query", "")
+
     # Patterns
     date_pattern = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
     explicit_id_pattern = re.compile(r"\b[A-Z]{3}\.(?:AIRPORT|CITY)\b")
     iata_pattern = re.compile(r"\b[A-Z]{3}\b")
 
-    # Extract explicit fromId/toId tokens first
-    explicit_ids = explicit_id_pattern.findall(history_text)
-    from_id = explicit_ids[0] if len(explicit_ids) >= 1 else None
-    to_id = explicit_ids[1] if len(explicit_ids) >= 2 else None
+    # Extract explicit fromId/toId prioritizing the most recent user query
+    from_id = None
+    to_id = None
+    # 1) Parse current raw_query first (highest priority)
+    current_explicit = explicit_id_pattern.findall(raw_query)
+    current_tokens = re.findall(r"\b[A-Z]{3}\.(?:AIRPORT|CITY)\b", raw_query)
+    if len(current_tokens) >= 1:
+        from_id = current_tokens[0]
+    if len(current_tokens) >= 2:
+        to_id = current_tokens[1]
+    # Try simple 'X to Y' in current query for IATA codes
+    if not (from_id and to_id):
+        m_cur = re.search(r"from\s+([A-Za-z\s]+?)\s+to\s+([A-Za-z\s]+)", raw_query, flags=re.IGNORECASE)
+        if m_cur:
+            cf = m_cur.group(1).strip().upper()
+            ct = m_cur.group(2).strip().upper()
+            if re.fullmatch(r"[A-Z]{3}", cf):
+                from_id = from_id or (cf + ".AIRPORT")
+            if re.fullmatch(r"[A-Z]{3}", ct):
+                to_id = to_id or (ct + ".AIRPORT")
+
+    # 2) Fall back to conversation history if still missing
+    if not (from_id and to_id):
+        explicit_ids = explicit_id_pattern.findall(history_text)
+        hist_tokens = re.findall(r"\b[A-Z]{3}\.(?:AIRPORT|CITY)\b", history_text)
+        if not from_id and len(hist_tokens) >= 1:
+            from_id = hist_tokens[0]
+        if not to_id and len(hist_tokens) >= 2:
+            to_id = hist_tokens[1]
 
     # If missing, try to infer from "X to Y" phrasing with IATA codes
     if not (from_id and to_id):
-        # Simple from/to pattern
+        # Simple from/to pattern in history
         m_from_to = re.search(r"from\s+([A-Za-z\s]+?)\s+to\s+([A-Za-z\s]+)", history_text, flags=re.IGNORECASE)
         if m_from_to:
             cand_from = m_from_to.group(1).strip()
             cand_to = m_from_to.group(2).strip()
-            # If looks like IATA
-            if re.fullmatch(r"[A-Z]{3}", cand_from.upper()):
+            if re.fullmatch(r"[A-Z]{3}", cand_from.upper()) and not from_id:
                 from_id = cand_from.upper() + ".AIRPORT"
-            if re.fullmatch(r"[A-Z]{3}", cand_to.upper()):
+            if re.fullmatch(r"[A-Z]{3}", cand_to.upper()) and not to_id:
                 to_id = cand_to.upper() + ".AIRPORT"
 
     # If still missing, use any standalone IATA codes (take first two order of appearance)
@@ -536,10 +563,88 @@ async def flight_agent(state: AgentState) -> dict[str, Any]:
         except Exception:
             flight_summary = base_line
 
+    # Chain: find hotels at destination city and append compact hotels JSON
+    hotels_compact: list[dict[str, Any]] = []
+    try:
+        # Import here to avoid circulars
+        from tools import booking_search_destination, booking_search_hotels
+
+        # Derive a destination query from to_id (strip suffix)
+        dest_query = to_id.split(".")[0] if to_id else ""
+        # Look up destination
+        dest_res = await booking_search_destination.ainvoke({"query": dest_query})
+        if dest_res.get("status") == "success":
+            dest_payload = dest_res.get("results", {})
+            data_field = dest_payload.get("data") if isinstance(dest_payload, dict) else None
+            candidates = data_field if isinstance(data_field, list) else None
+            if candidates and len(candidates) > 0:
+                first = candidates[0]
+                dest_id = first.get("dest_id") or first.get("id") or first.get("destination_id")
+                search_type = first.get("search_type") or first.get("type") or "CITY"
+                if dest_id:
+                    # Compute hotel check-in/out from flight date as 2 nights
+                    try:
+                        from datetime import datetime, timedelta
+                        ad = datetime.strptime(depart_date, "%Y-%m-%d")
+                        arrival_date = ad.strftime("%Y-%m-%d")
+                        departure_hotel = (ad + timedelta(days=2)).strftime("%Y-%m-%d")
+                    except Exception:
+                        arrival_date = depart_date
+                        departure_hotel = depart_date
+
+                    hotels_res = await booking_search_hotels.ainvoke({
+                        "dest_id": int(dest_id) if str(dest_id).lstrip("-").isdigit() else dest_id,
+                        "search_type": search_type,
+                        "arrival_date": arrival_date,
+                        "departure_date": departure_hotel,
+                        "adults": 1,
+                        "room_qty": 1,
+                        "page_number": 1,
+                        "units": "metric",
+                        "temperature_unit": "c",
+                        "languagecode": "en-us",
+                        "currency_code": "USD",
+                        "location": "US",
+                    })
+                    if hotels_res.get("status") == "success":
+                        h_payload = hotels_res.get("results", {})
+                        root = h_payload.get("data") if isinstance(h_payload, dict) else None
+                        hotels_list = None
+                        if isinstance(root, list):
+                            hotels_list = root
+                        elif isinstance(root, dict):
+                            hotels_list = root.get("hotels") or root.get("result") or root.get("items") or root.get("list")
+                        # Build compact hotels
+                        if isinstance(hotels_list, list):
+                            for h in hotels_list[:6]:
+                                prop = h.get("property", {}) if isinstance(h, dict) else {}
+                                name = prop.get("name") or h.get("name") or "Hotel"
+                                rating = prop.get("reviewScore") or prop.get("review_score")
+                                price_info = prop.get("priceBreakdown", {})
+                                gross = price_info.get("grossPrice", {})
+                                value = gross.get("value")
+                                currency = gross.get("currency") or price_info.get("currency")
+                                address = h.get("accessibilityLabel") or prop.get("address") or ""
+                                image_url = None
+                                photos = prop.get("photos") if isinstance(prop.get("photos"), list) else []
+                                if photos:
+                                    image_url = photos[0].get("url")
+                                hotels_compact.append({
+                                    "name": name,
+                                    "rating": rating,
+                                    "price": {"amount": value, "currency": currency} if value else None,
+                                    "location": address,
+                                    "imageUrl": image_url,
+                                    "amenities": []
+                                })
+    except Exception:
+        pass
+
     # Append a compact JSON block of top options for the chat UI to parse into cards
     try:
         compact = {
-            "items": top_structured[:10]
+            "items": top_structured[:10],
+            "hotels": hotels_compact[:6] if hotels_compact else []
         }
         flight_summary = flight_summary + "\n\n" + json.dumps(compact, ensure_ascii=False)
     except Exception:
