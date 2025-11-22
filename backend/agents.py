@@ -106,9 +106,55 @@ Respond ONLY with valid JSON:
             HumanMessage(content=f"[Context] Previous conversation (last 2 turns): {state['messages'][-2:]}")
         )
     
-    # Get routing decision from LLM
-    response = await llm.ainvoke(messages)
-    
+    # Get routing decision from LLM with graceful fallback on errors
+    try:
+        # Verify Google API key is properly loaded
+        import os
+        google_api_key = os.getenv('GOOGLE_API_KEY')
+        if not google_api_key or google_api_key == 'YOUR_GOOGLE_API_KEY':
+            raise ValueError("GOOGLE_API_KEY is not properly set in environment variables")
+            
+        response = await llm.ainvoke(messages)
+    except Exception as e:
+        error_msg = f"⚠️ Coordinator model error: {str(e)[:200]}"
+        if "API key" in str(e):
+            error_msg = "⚠️ Google API key issue. Please check your GOOGLE_API_KEY in .env.local"
+        
+        # Log the error
+        try:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Coordinator LLM error: {str(e)}")
+        except Exception:
+            pass
+            
+        # Fallback to research agent with detailed message
+        fallback_msg = (
+            f"{error_msg}\n"
+            "🔍 Falling back to research agent for your query..."
+        )
+        
+        # If this is an API key error, suggest checking the key
+        if "API key" in str(e):
+            fallback_msg += "\n\nℹ️ Note: Please ensure you've:"
+            fallback_msg += "\n1. Set a valid Google API key in .env.local"
+            fallback_msg += "\n2. Restarted your backend server after updating the key"
+            fallback_msg += "\n3. Enabled the Gemini API for your Google Cloud project"
+        
+        return {
+            **state,
+            "current_agent": "coordinator",
+            "next_agent": "research_agent",
+            "detected_intents": ["general"],
+            "coordinator_context": {
+                "last_routing": "general",
+                "extracted_details": {},
+                "timestamp": time.time(),
+                "error": str(e),
+            },
+            "messages": state["messages"] + [AIMessage(content=fallback_msg)],
+            "status": "routed",
+        }
+
     # Parse routing decision robustly
     raw_text = None
     if isinstance(response, str):
