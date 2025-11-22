@@ -8,9 +8,16 @@ import time
 import json
 import httpx
 import asyncio
+from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain_core.tools import tool
 from typing import Optional, Any, Dict, Tuple
+
+# Load env so RAPIDAPI_KEY is available
+load_dotenv()
+project_root = Path(__file__).resolve().parents[1]
+load_dotenv(project_root / ".env.local", override=False)
 
 # --- Lightweight in-memory cache (process-local) ---
 _CACHE: dict[Tuple[str, str], Tuple[float, Any]] = {}
@@ -179,17 +186,14 @@ async def booking_search_hotels(
     location: Optional[str] = None,
     interruption_check: Optional[dict] = None
 ) -> Dict[str, Any]:
-    """
-    Search hotels via Booking.com RapidAPI.
+    """Search hotels via Booking.com RapidAPI (hotels/searchHotels)."""
 
-    Requires environment variable RAPIDAPI_KEY to be set.
-    """
     # Interruption check
     if interruption_check and interruption_check.get("should_interrupt"):
         return {"status": "interrupted", "message": "Hotel search cancelled"}
 
     base_url = "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels"
-    params = {
+    params: Dict[str, Any] = {
         "dest_id": dest_id,
         "search_type": search_type,
         "arrival_date": arrival_date,
@@ -213,27 +217,22 @@ async def booking_search_hotels(
     if location:
         params["location"] = location
 
-    headers = {
-        "x-rapidapi-host": "booking-com15.p.rapidapi.com",
-        "x-rapidapi-key": api_key,
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(base_url, params=params, headers=headers)
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
-            if resp.status_code >= 400:
-                return {
-                    "status": "error",
-                    "code": resp.status_code,
-                    "message": data.get("message") if isinstance(data, dict) else "HTTP error",
-                    "response": data,
-                }
-            return {
-                "status": "success",
-                "query": params,
-                "results": data,
-            }
+        cache_key = ("hotels", json.dumps(params, sort_keys=True))
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+
+        res = await _rapidapi_get(base_url, params)
+        if res.get("status") != "success":
+            return res
+        out: Dict[str, Any] = {
+            "status": "success",
+            "query": params,
+            "results": res.get("data"),
+        }
+        _cache_set(cache_key, out)
+        return out
     except httpx.RequestError as e:
         return {"status": "error", "message": f"Network error: {e}"}
     except Exception as e:
@@ -411,6 +410,146 @@ async def web_search(
     }
 
 
+@tool
+async def search_attractions(
+    location: str,
+    interruption_check: Optional[dict] = None
+) -> dict[str, Any]:
+    """Search attractions for a city using Booking.com attractions API.
+
+    Tries the real Booking attractions endpoints and falls back to sample data
+    if the API call fails or returns no attractions, so the UI can always
+    render cards for demos.
+    """
+
+    if interruption_check and interruption_check.get("should_interrupt"):
+        return {
+            "status": "interrupted",
+            "message": "Attraction search was cancelled",
+            "partial_results": interruption_check.get("partial_results", {}),
+        }
+
+    # Helper to build a few mock attractions (for fallback/demo)
+    def _mock_attractions(city: str) -> dict[str, Any]:
+        demo = [
+            {
+                "name": f"City Highlights Tour - {city}",
+                "rating": 4.7,
+                "reviews": 1200,
+                "price": {"amount": 35, "currency": "USD"},
+                "duration": "4h",
+                "location": city,
+                "imageUrl": None,
+            },
+            {
+                "name": f"Old Town Walking Tour - {city}",
+                "rating": 4.5,
+                "reviews": 840,
+                "price": {"amount": 20, "currency": "USD"},
+                "duration": "3h",
+                "location": city,
+                "imageUrl": None,
+            },
+        ]
+        return {
+            "status": "success",
+            "query": {"location": city},
+            "results": {"data": {"attractions": demo}},
+        }
+
+    # First, try to resolve an attraction location ID via searchLocation
+    base_loc = "https://booking-com15.p.rapidapi.com/api/v1/attraction/searchLocation"
+    try:
+        loc_res = await _rapidapi_get(base_loc, {"query": location})
+        if loc_res.get("status") != "success":
+            return _mock_attractions(location)
+        loc_data = loc_res.get("data") or {}
+        root = loc_data.get("data") if isinstance(loc_data, dict) else None
+
+        # According to docs, id can be inside products or destinations
+        candidates = None
+        if isinstance(root, dict):
+            candidates = root.get("products") or root.get("destinations")
+        if candidates is None and isinstance(root, list):
+            candidates = root
+        if not isinstance(candidates, list) or not candidates:
+            return _mock_attractions(location)
+
+        first = candidates[0]
+        loc_id = first.get("id") or first.get("ufi") or first.get("dest_id")
+        if not loc_id:
+            return _mock_attractions(location)
+
+        # Now search attractions for that id
+        base_attr = "https://booking-com15.p.rapidapi.com/api/v1/attraction/searchAttractions"
+        params: Dict[str, Any] = {
+            "id": loc_id,
+            "sortBy": "trending",
+            "page": 1,
+            "currency_code": "INR",
+            "languagecode": "en-us",
+        }
+        attr_res = await _rapidapi_get(base_attr, params)
+        if attr_res.get("status") != "success":
+            return _mock_attractions(location)
+
+        out = {
+            "status": "success",
+            "query": params,
+            "results": attr_res.get("data"),
+        }
+        return out
+    except httpx.RequestError:
+        return _mock_attractions(location)
+    except Exception:
+        return _mock_attractions(location)
+
+
+@tool
+async def get_attraction_details(
+    attraction_id: str,
+    interruption_check: Optional[dict] = None
+) -> dict[str, Any]:
+    """Get detailed information for a specific attraction.
+
+    Wraps Booking.com `api/v1/attraction/getAttractionDetails`.
+    """
+
+    if interruption_check and interruption_check.get("should_interrupt"):
+        return {
+            "status": "interrupted",
+            "message": "Attraction details fetch was cancelled",
+            "partial_results": interruption_check.get("partial_results", {}),
+        }
+
+    base_url = "https://booking-com15.p.rapidapi.com/api/v1/attraction/getAttractionDetails"
+    params = {
+        "id": attraction_id,
+        "currency_code": "INR",
+        "languagecode": "en-us",
+    }
+    try:
+        res = await _rapidapi_get(base_url, params)
+        if res.get("status") != "success":
+            return res
+        return {
+            "status": "success",
+            "query": params,
+            "results": res.get("data"),
+        }
+    except httpx.RequestError as e:
+        return {"status": "error", "message": f"Network error: {e}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Unexpected error: {e}"}
+
+
 # Export all tools as a list
-ALL_TOOLS = [search_flights, search_hotels, booking_search_hotels, booking_search_destination, web_search]
-ALL_TOOLS = [search_flights, search_hotels, booking_search_hotels, web_search]
+ALL_TOOLS = [
+    search_flights,
+    search_hotels,
+    booking_search_hotels,
+    booking_search_destination,
+    web_search,
+    search_attractions,
+    get_attraction_details,
+]

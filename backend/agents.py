@@ -36,7 +36,7 @@ async def coordinator_agent(state: AgentState) -> dict[str, Any]:
     Coordinator Agent: Main orchestrator that analyzes user intent and routes to specialists.
     
     Responsibilities:
-    - Analyze user queries to detect intent (flight, hotel, general info)
+    - Analyze user queries to detect intent (flight, hotel, attractions, general info)
     - Route requests to appropriate specialized agents
     - Handle seamless handoffs between agents
     - Manage interruption context
@@ -70,7 +70,8 @@ async def coordinator_agent(state: AgentState) -> dict[str, Any]:
 1. What type of assistance they need:
    - FLIGHT: Finding flights, booking flights, flight prices, schedules
    - HOTEL: Finding hotels, accommodations, lodging, places to stay
-   - GENERAL: Travel tips, destinations, weather, visa info, attractions
+   - ATTRACTION: Sightseeing, attractions, things to do, places to visit
+   - GENERAL: Travel tips, destinations, weather, visa info
    - BOTH: When user needs both flights and hotels
 
 2. Extract key details:
@@ -82,7 +83,7 @@ async def coordinator_agent(state: AgentState) -> dict[str, Any]:
 
 Respond ONLY with valid JSON:
 {
-  "intent": "flight|hotel|general|both",
+  "intent": "flight|hotel|attraction|general|both",
   "confidence": 0.0-1.0,
   "details": {
     "origin": "city",
@@ -191,6 +192,8 @@ Respond ONLY with valid JSON:
             intent = "flight"
         elif any(word in query_lower for word in ["hotel", "stay", "accommodation", "lodge"]):
             intent = "hotel"
+        elif any(word in query_lower for word in ["attraction", "things to do", "places to visit", "sightseeing"]):
+            intent = "attraction"
         else:
             intent = "general"
         details = {}
@@ -200,6 +203,7 @@ Respond ONLY with valid JSON:
     next_agent_mapping = {
         "flight": "flight_agent",
         "hotel": "hotel_agent",
+        "attraction": "attractions_agent",
         "general": "research_agent",
         "both": "flight_agent"  # Start with flights, hotel will be chained
     }
@@ -354,18 +358,42 @@ async def flight_agent(state: AgentState) -> dict[str, Any]:
     date_match = date_pattern.search(history_text)
     depart_date = date_match.group(0) if date_match else None
 
-    # Assume reasonable defaults if still missing
+    # Validate and set airport codes
     assumed = []
-    if not from_id and to_id:
-        from_id = "BOM.AIRPORT"
-        assumed.append("fromId=BOM.AIRPORT")
-    if not to_id and from_id:
-        to_id = "DEL.AIRPORT"
-        assumed.append("toId=DEL.AIRPORT")
-    if not from_id and not to_id:
-        from_id = "BOM.AIRPORT"
-        to_id = "DEL.AIRPORT"
-        assumed.append("fromId=BOM.AIRPORT, toId=DEL.AIRPORT")
+    
+    # If we have IATA codes, ensure they're in the correct format
+    if not from_id and 'from' in state:
+        from_id = f"{state['from']}.AIRPORT"
+    if not to_id and 'to' in state:
+        to_id = f"{state['to']}.AIRPORT"
+    
+    # If still missing, try to extract from the query
+    if not from_id or not to_id:
+        # Try to extract airport codes from the query using regex
+        query = state.get('query', '').lower()
+        
+        # Look for patterns like "from ABC to XYZ" or "ABC to XYZ"
+        match = re.search(r'(?:from\s+)?([a-z]{3})\s+(?:to|2|\-)\s+([a-z]{3})', query)
+        if match:
+            if not from_id:
+                from_id = f"{match.group(1).upper()}.AIRPORT"
+            if not to_id:
+                to_id = f"{match.group(2).upper()}.AIRPORT"
+    
+    # If still missing, use the first available code for the missing one
+    if from_id and not to_id:
+        to_id = f"{state.get('to', 'BOM')}.AIRPORT"
+    elif to_id and not from_id:
+        from_id = f"{state.get('from', 'BOM')}.AIRPORT"
+    elif not from_id and not to_id:
+        # If we still don't have both, use the ones from the query or default to BOM-DEL
+        from_id = f"{state.get('from', 'BOM')}.AIRPORT"
+        to_id = f"{state.get('to', 'DEL')}.AIRPORT"
+        assumed.append(f"Using default route: {from_id} to {to_id}")
+    
+    # Log the final values
+    if from_id and to_id:
+        logging.info(f"Flight search: {from_id} -> {to_id} on {depart_date}")
     if not depart_date:
         depart_date = (datetime.utcnow() + timedelta(days=21)).strftime("%Y-%m-%d")
         assumed.append(f"departDate={depart_date}")
@@ -630,7 +658,6 @@ async def flight_agent(state: AgentState) -> dict[str, Any]:
                 if dest_id:
                     # Compute hotel check-in/out from flight date as 2 nights
                     try:
-                        from datetime import datetime, timedelta
                         ad = datetime.strptime(depart_date, "%Y-%m-%d")
                         arrival_date = ad.strftime("%Y-%m-%d")
                         departure_hotel = (ad + timedelta(days=2)).strftime("%Y-%m-%d")
@@ -750,66 +777,231 @@ async def hotel_agent(state: AgentState) -> dict[str, Any]:
     
     # Record agent activation
     state["previous_agents"].append("hotel_agent")
-    state["active_tool_calls"].append("search_hotels")
-    
-    from tools import search_hotels
-    
-    # Extract location from query
-    query = state["user_query"].lower()
-    location = "Los Angeles"  # Default
-    
-    # Simple extraction
-    if "in" in query:
-        parts = query.split("in")
+    state["active_tool_calls"].append("booking_search_hotels")
+
+    # Import tools lazily to avoid circulars
+    from tools import booking_search_destination, booking_search_hotels
+
+    # Extract rough location text from query
+    query_text = state.get("user_query", "")
+    q_lower = query_text.lower()
+    location = None
+    # Very simple "in X" heuristic first
+    if " in " in q_lower:
+        parts = q_lower.split(" in ", 1)
         if len(parts) > 1:
-            location = parts[1].strip().split()[0].title()
-    
-    # Call hotel search tool
+            location = parts[1].strip().split("\n")[0].strip()
+    if not location:
+        # Fallback: if coordinator details has destination, use that
+        details = state.get("coordinator_context", {}).get("extracted_details", {}) or {}
+        loc = details.get("destination") or details.get("origin")
+        if isinstance(loc, str) and loc.strip():
+            location = loc
+    if not location:
+        # Last resort: use whole query
+        location = query_text.strip() or "Mumbai"
+
+    # Interruption context
     interruption_context = {
         "should_interrupt": state.get("should_interrupt", False),
-        "partial_results": state.get("partial_results", {})
+        "partial_results": state.get("partial_results", {}),
     }
-    
-    hotel_results = await search_hotels.ainvoke({
-        "location": location,
-        "interruption_check": interruption_context
+
+    # 1) Resolve destination ID via Booking destination search
+    dest_res = await booking_search_destination.ainvoke({"query": location})
+    if dest_res.get("status") != "success":
+        err = dest_res.get("message", "Destination lookup failed")
+        error_text = f"⚠️ Hotel destination search failed: {err}"
+        return {
+            **state,
+            "current_agent": "hotel_agent",
+            "messages": state["messages"] + [AIMessage(content=error_text)],
+            "status": "complete",
+        }
+
+    dest_payload = dest_res.get("results", {})
+    data_field = dest_payload.get("data") if isinstance(dest_payload, dict) else None
+    candidates = data_field if isinstance(data_field, list) else None
+    if not candidates:
+        msg = f"⚠️ No hotel destinations found for '{location}'. Try another city."
+        return {
+            **state,
+            "current_agent": "hotel_agent",
+            "messages": state["messages"] + [AIMessage(content=msg)],
+            "status": "complete",
+        }
+
+    first = candidates[0]
+    dest_id = first.get("dest_id") or first.get("id") or first.get("destination_id")
+    search_type = first.get("search_type") or first.get("type") or "CITY"
+
+    # Basic dates: 2 nights starting ~3 weeks from now
+    try:
+        base = datetime.utcnow() + timedelta(days=21)
+        arrival_date = base.strftime("%Y-%m-%d")
+        departure_date = (base + timedelta(days=2)).strftime("%Y-%m-%d")
+    except Exception:
+        arrival_date = datetime.utcnow().strftime("%Y-%m-%d")
+        departure_date = arrival_date
+
+    # 2) Call Booking hotels search
+    hotels_res = await booking_search_hotels.ainvoke({
+        "dest_id": int(dest_id) if str(dest_id).lstrip("-").isdigit() else dest_id,
+        "search_type": search_type,
+        "arrival_date": arrival_date,
+        "departure_date": departure_date,
+        "adults": 1,
+        "room_qty": 1,
+        "page_number": 1,
+        "price_min": 0,
+        "price_max": 0,
+        "sort_by": "REVIEW_SCORE",
+        "units": "metric",
+        "temperature_unit": "c",
+        "languagecode": "en-us",
+        "currency_code": "USD",
+        "interruption_check": interruption_context,
     })
-    
-    # Check if interrupted
-    if hotel_results.get("status") == "interrupted":
-        state["partial_results"]["hotels"] = hotel_results.get("partial_results", {})
+
+    if hotels_res.get("status") == "interrupted":
+        state["partial_results"]["hotels"] = hotels_res.get("partial_results", {})
         return {
             **state,
             "status": "interrupted",
-            "is_interrupted": True
+            "is_interrupted": True,
         }
-    
-    # Format results
-    hotels = hotel_results.get("hotels", [])
-    hotel_summary = f"🏨 Found {len(hotels)} hotels in {location}:\n\n"
-    
-    for i, hotel in enumerate(hotels[:3], 1):
-        hotel_summary += f"{i}. {hotel['name']} - ${hotel['price_per_night']}/night\n"
-        hotel_summary += f"   Rating: {hotel['rating']}⭐ ({hotel['reviews_count']} reviews)\n"
-        hotel_summary += f"   Amenities: {', '.join(hotel['amenities'][:3])}\n\n"
-    
+
+    if hotels_res.get("status") == "error":
+        err_msg = hotels_res.get("message") or "Hotel search error"
+        code = hotels_res.get("code")
+        detail = f" (code {code})" if code else ""
+        error_text = f"⚠️ Hotel search failed{detail}: {err_msg}"
+        return {
+            **state,
+            "current_agent": "hotel_agent",
+            "messages": state["messages"] + [AIMessage(content=error_text)],
+            "status": "complete",
+        }
+
+    # Extract hotel list from Booking.com payload
+    def _extract_hotel_list(payload: Any) -> Any:
+        root_local = payload.get("data") if isinstance(payload, dict) else None
+        hotels_local = None
+        if isinstance(root_local, list):
+            hotels_local = root_local
+        elif isinstance(root_local, dict):
+            hotels_local = (
+                root_local.get("hotels")
+                or root_local.get("result")
+                or root_local.get("items")
+                or root_local.get("list")
+            )
+
+            if hotels_local is None:
+                for vv in root_local.values():
+                    if isinstance(vv, list) and vv and isinstance(vv[0], dict):
+                        hotels_local = vv
+                        break
+
+        if hotels_local is None and isinstance(payload, dict):
+            for vv in payload.values():
+                if isinstance(vv, list) and vv and isinstance(vv[0], dict):
+                    hotels_local = vv
+                    break
+        return hotels_local
+
+    results_payload = hotels_res.get("results")
+    hotels_list = _extract_hotel_list(results_payload)
+
+    # If first search came back with no hotels, retry once with relaxed params
+    if isinstance(hotels_list, list) and not hotels_list:
+        try:
+            alt_base = datetime.utcnow() + timedelta(days=7)
+            alt_arrival = alt_base.strftime("%Y-%m-%d")
+            alt_departure = (alt_base + timedelta(days=2)).strftime("%Y-%m-%d")
+
+            hotels_res_alt = await booking_search_hotels.ainvoke({
+                "dest_id": int(dest_id) if str(dest_id).lstrip("-").isdigit() else dest_id,
+                "search_type": search_type,
+                "arrival_date": alt_arrival,
+                "departure_date": alt_departure,
+                "adults": 1,
+                "room_qty": 1,
+                "page_number": 1,
+                "price_min": 0,
+                "price_max": 0,
+                "units": "metric",
+                "temperature_unit": "c",
+                "languagecode": "en-us",
+                "currency_code": "USD",
+            })
+            if hotels_res_alt.get("status") == "success":
+                results_payload = hotels_res_alt.get("results")
+                hotels_list = _extract_hotel_list(results_payload)
+                # Also adjust summary dates to the ones that actually produced results
+                arrival_date = alt_arrival
+                departure_date = alt_departure
+        except Exception:
+            pass
+
+    hotels_compact: list[dict[str, Any]] = []
+    if isinstance(hotels_list, list):
+        for h in hotels_list[:10]:
+            if not isinstance(h, dict):
+                continue
+            prop = h.get("property", {}) if isinstance(h.get("property"), dict) else h
+            name = prop.get("name") or h.get("name") or "Hotel"
+            rating = prop.get("reviewScore") or prop.get("review_score")
+            price_info = prop.get("priceBreakdown", {}) if isinstance(prop.get("priceBreakdown"), dict) else {}
+            gross = price_info.get("grossPrice", {}) if isinstance(price_info.get("grossPrice"), dict) else {}
+            value = gross.get("value")
+            currency = gross.get("currency") or price_info.get("currency")
+            address = (
+                h.get("accessibilityLabel")
+                or prop.get("address")
+                or prop.get("city")
+                or ""
+            )
+            image_url = None
+            photos = prop.get("photos") if isinstance(prop.get("photos"), list) else []
+            if photos:
+                image_url = photos[0].get("url")
+
+            hotels_compact.append(
+                {
+                    "name": name,
+                    "rating": rating,
+                    "price": {"amount": value, "currency": currency} if value else None,
+                    "location": address,
+                    "imageUrl": image_url,
+                    "amenities": [],
+                }
+            )
+
+    count = len(hotels_compact)
+    base_line = f"🏨 Searching hotels in {location.title() if isinstance(location, str) else location} for {arrival_date} to {departure_date}."
+    if count:
+        hotel_summary = base_line + f"\n\nFound {count} options."
+    else:
+        hotel_summary = base_line + "\n\nNo hotels found from Booking.com payload."
+
+    # Append compact JSON for UI cards (similar shape to flight_agent)
+    try:
+        compact = {"items": [], "hotels": hotels_compact[:10]}
+        hotel_summary = hotel_summary + "\n\n" + json.dumps(compact, ensure_ascii=False)
+    except Exception:
+        pass
+
     # Update hotel context
     state["hotel_context"] = {
         "last_search": {
             "location": location,
-            "results_count": len(hotels),
-            "timestamp": time.time()
+            "results_count": count,
+            "timestamp": time.time(),
         },
-        "results": hotel_results
+        "results": hotels_res,
     }
-    
-    state["completed_tool_calls"].append({
-        "tool": "search_hotels",
-        "agent": "hotel_agent",
-        "timestamp": time.time(),
-        "results_count": len(hotels)
-    })
-    
+
     return {
         **state,
         "current_agent": "hotel_agent",
@@ -842,32 +1034,303 @@ async def research_agent(state: AgentState) -> dict[str, Any]:
         }
     
     state["previous_agents"].append("research_agent")
-    
+
+    query_text = state.get("user_query", "")
+    q_lower = query_text.lower()
+
+    # If this is clearly an attractions query, answer using Booking.com attractions APIs
+    if any(kw in q_lower for kw in ["attraction", "things to do", "places to visit", "sightseeing"]):
+        from tools import search_attractions, get_attraction_details
+
+        # Derive location from query or coordinator context
+        location: str | None = None
+        if " in " in q_lower:
+            parts = q_lower.split(" in ", 1)
+            if len(parts) > 1:
+                location = parts[1].strip().split("\n")[0].strip()
+        if not location:
+            details = state.get("coordinator_context", {}).get("extracted_details", {}) or {}
+            loc = details.get("destination") or details.get("origin")
+            if isinstance(loc, str) and loc.strip():
+                location = loc
+        if not location:
+            location = query_text.strip() or "Delhi"
+
+        interruption_ctx = {
+            "should_interrupt": state.get("should_interrupt", False),
+            "partial_results": state.get("partial_results", {}),
+        }
+
+        attr_res = await search_attractions.ainvoke({
+            "location": location,
+            "interruption_check": interruption_ctx,
+        })
+
+        if attr_res.get("status") == "interrupted":
+            return {
+                **state,
+                "status": "interrupted",
+                "is_interrupted": True,
+            }
+
+        if attr_res.get("status") != "success":
+            msg = attr_res.get("message") or "Attraction search error"
+            fallback = f"⚠️ Could not fetch live attractions for {location}. {msg}"
+            return {
+                **state,
+                "current_agent": "research_agent",
+                "messages": state["messages"] + [AIMessage(content=fallback)],
+                "status": "complete",
+            }
+
+        # Extract attraction list from search results
+        results_payload = attr_res.get("results")
+        root = results_payload.get("data") if isinstance(results_payload, dict) else None
+        attractions_list = None
+        if isinstance(root, list):
+            attractions_list = root
+        elif isinstance(root, dict):
+            attractions_list = (
+                root.get("attractions")
+                or root.get("items")
+                or root.get("results")
+            )
+            if attractions_list is None:
+                for v in root.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        attractions_list = v
+                        break
+
+        if not isinstance(attractions_list, list) or not attractions_list:
+            text = f"🎡 I couldn't find specific attractions for {location} from Booking.com."
+            return {
+                **state,
+                "current_agent": "research_agent",
+                "messages": state["messages"] + [AIMessage(content=text)],
+                "status": "complete",
+            }
+
+        # For top few attractions, also fetch detailed info
+        bullets: list[str] = []
+        max_items = 5
+        for a in attractions_list[:max_items]:
+            if not isinstance(a, dict):
+                continue
+            # Basic fields from searchAttractions
+            info = a.get("property") if isinstance(a.get("property"), dict) else a
+            name = info.get("name") or a.get("title") or "Attraction"
+            rating = info.get("reviewScore") or info.get("rating")
+            reviews = info.get("reviewCount") or info.get("reviews")
+            price_info = info.get("priceBreakdown", {}) if isinstance(info.get("priceBreakdown"), dict) else {}
+            gross = price_info.get("grossPrice", {}) if isinstance(price_info.get("grossPrice"), dict) else {}
+            value = gross.get("value")
+            currency = gross.get("currency") or price_info.get("currency")
+
+            # Try to get an ID for details
+            attr_id = a.get("id") or info.get("id") or a.get("pinnedProductId")
+            desc = ""
+            duration = info.get("duration")
+
+            if attr_id:
+                try:
+                    details_res = await get_attraction_details.ainvoke({
+                        "attraction_id": attr_id,
+                        "interruption_check": interruption_ctx,
+                    })
+                    if details_res.get("status") == "success":
+                        det_payload = details_res.get("results")
+                        det_root = det_payload.get("data") if isinstance(det_payload, dict) else det_payload
+                        if isinstance(det_root, dict):
+                            desc = det_root.get("description") or det_root.get("shortDescription") or desc
+                            duration = det_root.get("duration") or duration
+                except Exception:
+                    pass
+
+            line = f"• {name}"
+            if rating:
+                try:
+                    line += f" | Rating: {float(rating):.1f}★"
+                except Exception:
+                    line += f" | Rating: {rating}★"
+            if reviews:
+                line += f" ({reviews} reviews)"
+            if value is not None:
+                cur = currency or "INR"
+                try:
+                    line += f" | From approx. {float(value):.0f} {cur}"
+                except Exception:
+                    line += f" | From approx. {value} {cur}"
+            if duration:
+                line += f" | Duration: {duration}"
+            if desc:
+                line += f"\n  {desc.strip()}"
+
+            bullets.append(line)
+
+        header = f"🎡 Here are some of the best attractions in {location} from Booking.com:\n\n"
+        body = "\n\n".join(bullets) if bullets else "No detailed attractions could be listed."
+        text = header + body
+
+        return {
+            **state,
+            "current_agent": "research_agent",
+            "messages": state["messages"] + [AIMessage(content=text)],
+            "status": "complete",
+        }
+
+    # Non-attraction queries: keep existing web_search behavior
     from tools import web_search
-    
-    # Perform web search
+
     search_results = await web_search.ainvoke({
         "query": state["user_query"],
         "max_results": 3
     })
-    
+
     if search_results.get("status") == "interrupted":
         return {
             **state,
             "status": "interrupted",
             "is_interrupted": True
         }
-    
-    # Format search results
+
     results = search_results.get("results", [])
     response = f"🔍 Here's what I found about your travel query:\n\n"
-    
+
     for result in results:
         response += f"• {result['title']}\n  {result['snippet']}\n\n"
-    
+
     return {
         **state,
         "current_agent": "research_agent",
         "messages": state["messages"] + [AIMessage(content=response)],
         "status": "complete"
+    }
+
+async def attractions_agent(state: AgentState) -> dict[str, Any]:
+    """Attractions Agent: lists popular attractions in a city.
+
+    Uses the search_attractions tool (Booking attractions API with fallback)
+    and returns a compact JSON block suitable for card rendering.
+    """
+
+    if state.get("should_interrupt", False):
+        return {
+            **state,
+            "status": "interrupted",
+            "is_interrupted": True,
+            "messages": state["messages"] + [
+                AIMessage(content="🎡 Attraction search was interrupted.")
+            ],
+        }
+
+    state["previous_agents"].append("attractions_agent")
+
+    from tools import search_attractions
+
+    # Extract rough location text from query
+    query_text = state.get("user_query", "")
+    q_lower = query_text.lower()
+    location = None
+    if " in " in q_lower:
+        parts = q_lower.split(" in ", 1)
+        if len(parts) > 1:
+            location = parts[1].strip().split("\n")[0].strip()
+    if not location:
+        details = state.get("coordinator_context", {}).get("extracted_details", {}) or {}
+        loc = details.get("destination") or details.get("origin")
+        if isinstance(loc, str) and loc.strip():
+            location = loc
+    if not location:
+        location = query_text.strip() or "Mumbai"
+
+    interruption_context = {
+        "should_interrupt": state.get("should_interrupt", False),
+        "partial_results": state.get("partial_results", {}),
+    }
+
+    tool_res = await search_attractions.ainvoke({
+        "location": location,
+        "interruption_check": interruption_context,
+    })
+
+    if tool_res.get("status") == "interrupted":
+        return {
+            **state,
+            "status": "interrupted",
+            "is_interrupted": True,
+        }
+
+    if tool_res.get("status") == "error":
+        msg = tool_res.get("message") or "Attraction search error"
+        return {
+            **state,
+            "current_agent": "attractions_agent",
+            "messages": state["messages"] + [AIMessage(content=f"⚠️ Attraction search failed: {msg}")],
+            "status": "complete",
+        }
+
+    results_payload = tool_res.get("results")
+    root = results_payload.get("data") if isinstance(results_payload, dict) else None
+    attractions_list = None
+    if isinstance(root, list):
+        attractions_list = root
+    elif isinstance(root, dict):
+        attractions_list = (
+            root.get("attractions")
+            or root.get("items")
+            or root.get("results")
+        )
+        if attractions_list is None:
+            for v in root.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    attractions_list = v
+                    break
+
+    compact: list[dict[str, Any]] = []
+    if isinstance(attractions_list, list):
+        for a in attractions_list[:10]:
+            if not isinstance(a, dict):
+                continue
+            info = a.get("property") if isinstance(a.get("property"), dict) else a
+            name = info.get("name") or a.get("title") or "Attraction"
+            rating = info.get("reviewScore") or info.get("rating")
+            reviews = info.get("reviewCount") or info.get("reviews")
+            price_info = info.get("priceBreakdown", {}) if isinstance(info.get("priceBreakdown"), dict) else {}
+            gross = price_info.get("grossPrice", {}) if isinstance(price_info.get("grossPrice"), dict) else {}
+            value = gross.get("value")
+            currency = gross.get("currency") or price_info.get("currency")
+            image_url = None
+            photos = info.get("photoUrls") if isinstance(info.get("photoUrls"), list) else []
+            if photos:
+                image_url = photos[0]
+
+            compact.append(
+                {
+                    "name": name,
+                    "rating": rating,
+                    "reviews": reviews,
+                    "price": {"amount": value, "currency": currency} if value else None,
+                    "location": location,
+                    "imageUrl": image_url,
+                }
+            )
+
+    count = len(compact)
+    base_line = f"🎡 Searching attractions in {location}."
+    if count:
+        summary = base_line + f"\n\nFound {count} options."
+    else:
+        summary = base_line + "\n\nNo attractions found from Booking.com payload; showing any available data."
+
+    try:
+        payload = {"items": [], "attractions": compact[:10]}
+        summary = summary + "\n\n" + json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return {
+        **state,
+        "current_agent": "attractions_agent",
+        "messages": state["messages"] + [AIMessage(content=summary)],
+        "status": "complete",
     }

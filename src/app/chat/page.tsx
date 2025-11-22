@@ -8,6 +8,7 @@ import { AgentStatus } from "@/components/chat/AgentStatus";
 import { TypingIndicator } from "@/components/chat/TypingIndicator";
 import { FlightCard } from "@/components/travel/FlightCard";
 import { HotelCard } from "@/components/travel/HotelCard";
+
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useSSEChat } from "@/hooks/useSSEChat";
@@ -188,7 +189,6 @@ export default function ChatPage() {
                     ))}
                   </motion.div>
                 )}
-
                 {message.isPartial && (
                   <motion.div
                     initial={{ opacity: 0, scale: 0.95 }}
